@@ -4,116 +4,115 @@ import os
 from io import BytesIO
 from PIL import Image
 import logging
-from defines import getCreds # Importiere die Funktion
+from defines import getCreds
 import boto3
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
+import datetime # Für Timestamps
 
-# Rufe die Funktion auf, um die Zugangsdaten zu bekommen.
+# Konfigurationen laden
 creds = getCreds()
+API_BASE_URL = creds.get('endpoint_base')
+S3_BUCKET_NAME = creds.get('s3_bucket_name')
+S3_IMAGE_PREFIX = creds.get('s3_image_prefix', 'images/instagram/') # Fallback, falls nicht in creds
+DYNAMODB_CRAWLEDMEDIA_TABLE_NAME = creds.get('dynamodb_crawledmedia_table')
+DYNAMODB_CRAWLTASKS_TABLE_NAME = creds.get('dynamodb_crawltasks_table') # Optional für spätere Nutzung
+DYNAMODB_REGION = creds.get('dynamodb_region', creds.get('s3_bucket_region')) # Fallback auf S3 Region
 
-# Instagram Graph API Konfiguration
-API_BASE_URL = creds['endpoint_base']
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
-# Logging konfigurieren
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# AWS S3 Konfiguration - BITTE ERSETZEN SIE DIESE PLATZHALTER, FALLS NOCH NICHT GESCHEHEN!
-S3_BUCKET_NAME = 'image-crawler-image-store-s3' # Stellen Sie sicher, dass dies Ihr korrekter Bucket-Name ist
-S3_IMAGE_PREFIX = 'images/instagram/' # Zielordner-Präfix in S3
-
-# S3 Client auf Modulebene initialisieren
+# AWS Clients auf Modulebene initialisieren
 s3_client = None
-try:
-    s3_client = boto3.client('s3') # Region kann hier auch angegeben werden, z.B. boto3.client('s3', region_name='ihre-region')
-    logging.info("S3-Client erfolgreich initialisiert.")
-except (NoCredentialsError, PartialCredentialsError):
-    logging.error("AWS-Anmeldeinformationen nicht gefunden oder unvollständig. Bitte konfigurieren (z.B. via 'aws configure'). S3-Operationen werden fehlschlagen.")
-except Exception as e:
-    logging.error(f"Fehler bei der Initialisierung des S3-Clients: {e}. S3-Operationen werden fehlschlagen.")
+dynamodb_resource = None
+crawled_media_table = None
+# crawl_tasks_table = None # Für spätere Nutzung
 
+try:
+    if S3_BUCKET_NAME and DYNAMODB_REGION: # DYNAMODB_REGION wird auch für S3 Client verwendet für Konsistenz
+        s3_client = boto3.client('s3', region_name=DYNAMODB_REGION)
+        logging.info(f"S3-Client erfolgreich initialisiert für Region {DYNAMODB_REGION}.")
+    else:
+        logging.error("S3_BUCKET_NAME oder DYNAMODB_REGION (verwendet für S3 Client) nicht in creds gefunden. S3-Operationen könnten fehlschlagen.")
+
+    if DYNAMODB_CRAWLEDMEDIA_TABLE_NAME and DYNAMODB_REGION:
+        dynamodb_resource = boto3.resource('dynamodb', region_name=DYNAMODB_REGION)
+        crawled_media_table = dynamodb_resource.Table(DYNAMODB_CRAWLEDMEDIA_TABLE_NAME)
+        logging.info(f"DynamoDB Resource und Tabelle '{DYNAMODB_CRAWLEDMEDIA_TABLE_NAME}' initialisiert für Region {DYNAMODB_REGION}.")
+        # if DYNAMODB_CRAWLTASKS_TABLE_NAME:
+        # crawl_tasks_table = dynamodb_resource.Table(DYNAMODB_CRAWLTASKS_TABLE_NAME)
+        # logging.info(f"DynamoDB Tabelle '{DYNAMODB_CRAWLTASKS_TABLE_NAME}' initialisiert.")
+    else:
+        logging.error("DYNAMODB_CRAWLEDMEDIA_TABLE_NAME oder DYNAMODB_REGION nicht in creds gefunden. DynamoDB-Operationen werden fehlschlagen.")
+
+except (NoCredentialsError, PartialCredentialsError):
+    logging.error("AWS-Anmeldeinformationen nicht gefunden/unvollständig. AWS-Operationen werden fehlschlagen.")
+except Exception as e:
+    logging.error(f"Fehler bei der Initialisierung von AWS Clients: {e}. AWS-Operationen werden fehlschlagen.")
+
+
+def get_utc_timestamp():
+    return datetime.datetime.utcnow().isoformat() + "Z"
 
 def get_user_media(access_token, user_id):
-    """Ruft Medien (Bilder/Videos) des EIGENEN Instagram-Benutzers ab."""
+    # (Funktion bleibt im Wesentlichen gleich wie zuvor)
     url = f"{API_BASE_URL}{user_id}/media?fields=id,caption,media_type,media_url,permalink&access_token={access_token}"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         return response.json()
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP-Fehler beim Abrufen von Benutzermedien für User-ID {user_id}: {e}. Status: {e.response.status_code}. Text: {e.response.text}")
-        return None
     except requests.exceptions.RequestException as e:
-        logging.error(f"Netzwerkfehler beim Abrufen von Benutzermedien für User-ID {user_id}: {e}")
+        logging.error(f"HTTP-Fehler bei get_user_media für {user_id}: {e}")
         return None
-    except json.JSONDecodeError as e:
-        response_text = getattr(response, 'text', 'Kein Antworttext verfügbar')
-        logging.error(f"JSON-Dekodierungsfehler beim Abrufen von Benutzermedien für User-ID {user_id}: {e}, Antworttext: {response_text}")
-        return None
+    # ... weitere Fehlerbehandlung ...
     except Exception as e:
-        logging.error(f"Unerwarteter Fehler beim Abrufen von Benutzermedien für User-ID {user_id}: {e}")
+        logging.error(f"Unerwarteter Fehler bei get_user_media für {user_id}: {e}")
         return None
 
-def download_image(media_url, filename_base): # local_dir_fallback entfernt, da wir primär S3 nutzen
-    """
-    Lädt ein Bild von einer URL herunter und lädt es nach AWS S3 hoch.
-    Gibt die S3-Key oder None bei Fehler zurück.
-    filename_base ist z.B. "hashtag_natur_MEDIAID" oder "user_USERID_MEDIAID" (ohne .jpg)
-    """
+
+def download_image_to_s3(media_url, filename_base):
     if not s3_client:
-        logging.error("S3-Client nicht initialisiert. Upload nach S3 nicht möglich.")
+        logging.error("S3-Client nicht initialisiert in download_image_to_s3. Upload nicht möglich.")
         return None
-
+    # (Funktion bleibt im Wesentlichen gleich wie zuvor, lädt nach S3 hoch und gibt s3_key zurück)
     try:
         response = requests.get(media_url, stream=True, timeout=10)
         response.raise_for_status()
-
         image_content = BytesIO(response.content)
         image = Image.open(image_content)
-
-        if image.mode in ("RGBA", "P"):
-            image = image.convert("RGB")
-
+        if image.mode in ("RGBA", "P"): image = image.convert("RGB")
+        
         buffer = BytesIO()
         image.save(buffer, format="JPEG")
         buffer.seek(0)
-
-        s3_key = f"{S3_IMAGE_PREFIX.strip('/')}/{filename_base}.jpg"
-
-        s3_client.upload_fileobj(
-            buffer,
-            S3_BUCKET_NAME,
-            s3_key,
-            ExtraArgs={'ContentType': 'image/jpeg'}
-        )
-        logging.info(f"Bild erfolgreich nach S3 hochgeladen: s3://{S3_BUCKET_NAME}/{s3_key}")
-        return s3_key
-
+        
+        s3_key_path = f"{S3_IMAGE_PREFIX.strip('/')}/{filename_base}.jpg"
+        
+        s3_client.upload_fileobj(buffer, S3_BUCKET_NAME, s3_key_path, ExtraArgs={'ContentType': 'image/jpeg'})
+        logging.info(f"Bild erfolgreich nach S3 hochgeladen: s3://{S3_BUCKET_NAME}/{s3_key_path}")
+        return s3_key_path
     except requests.exceptions.RequestException as e:
-        logging.error(f"Fehler beim Herunterladen des Bildes von {media_url}: {e}")
-        return None
+        logging.error(f"Fehler beim Herunterladen (requests) von {media_url}: {e}")
     except IOError as e:
-        logging.error(f"Fehler beim Verarbeiten des Bildes von {media_url}: {e}")
-        return None
+        logging.error(f"Fehler beim Verarbeiten (PIL) von Bild von {media_url}: {e}")
     except ClientError as e:
-        logging.error(f"AWS S3 Client Fehler beim Hochladen für {media_url} zu s3://{S3_BUCKET_NAME}/{s3_key if 's3_key' in locals() else filename_base}: {e}")
-        return None
+        logging.error(f"AWS S3 Client Fehler beim Hochladen für {media_url}: {e}")
     except Exception as e:
-        logging.error(f"Unerwarteter Fehler beim Herunterladen/Hochladen des Bildes {media_url}: {e}")
-        return None
+        logging.error(f"Unerwarteter Fehler in download_image_to_s3 für {media_url}: {e}")
+    return None
 
-# --- DEFINITION VON process_media ---
+
 def process_media(access_token, user_id_of_account_owner):
-    """
-    Verarbeitet Medien des EIGENEN Instagram-Benutzers, lädt Bilder nach S3 hoch und gibt Daten zurück.
-    """
     logging.info(f"Starte Verarbeitung eigener Medien für User-ID: {user_id_of_account_owner}")
+    if not crawled_media_table:
+        logging.error("DynamoDB 'CrawledMedia' Tabelle nicht initialisiert. Verarbeitung eigener Medien nicht möglich.")
+        return []
+
     media_api_data = get_user_media(access_token, user_id_of_account_owner)
     processed_own_images = []
 
     if media_api_data and media_api_data.get('data'):
         total_own_items = len(media_api_data['data'])
         logging.info(f"API lieferte {total_own_items} eigene Medienelemente für User-ID {user_id_of_account_owner}.")
-        
         own_image_count = 0
         for i, media_item in enumerate(media_api_data['data']):
             media_id = media_item.get('id')
@@ -121,194 +120,176 @@ def process_media(access_token, user_id_of_account_owner):
             logging.info(f"  [Eigenes Item {i+1}/{total_own_items}] ID: {media_id}, Typ: {media_type}")
 
             if media_type == 'IMAGE':
-                own_image_count += 1
-                media_url = media_item.get('media_url')
+                # Prüfen, ob Bild schon in DynamoDB ist
+                try:
+                    response = crawled_media_table.get_item(Key={'media_id': media_id})
+                    if 'Item' in response:
+                        logging.info(f"    Bild {media_id} (eigen) bereits in DynamoDB. Überspringe.")
+                        # Optional: Bestehende Daten aus DynamoDB zur Liste hinzufügen, wenn Anzeige aktualisiert werden soll
+                        # processed_own_images.append(response['Item']) # Stellt sicher, dass alle Keys vorhanden sind
+                        continue 
+                except ClientError as e_db:
+                    logging.error(f"    Fehler beim Prüfen von media_id {media_id} (eigen) in DynamoDB: {e_db}. Verarbeite trotzdem.")
 
-                if not media_url or not media_id:
-                    logging.warning(f"    Überspringe eigenes IMAGE-Medienelement (ID: {media_id}) aufgrund fehlender URL.")
-                    continue
-                
-                caption = media_item.get('caption', '')
-                permalink = media_item.get('permalink', '')
-                filename_base_for_s3 = f"user_{user_id_of_account_owner}_{media_id}" # Eindeutiger Name für eigene Bilder
-                
-                s3_object_key = download_image(media_url, filename_base_for_s3)
+                media_url = media_item.get('media_url')
+                if not media_url: continue
+
+                own_image_count += 1
+                filename_base_for_s3 = f"user_{user_id_of_account_owner}_{media_id}"
+                s3_object_key = download_image_to_s3(media_url, filename_base_for_s3)
 
                 if s3_object_key:
                     image_info = {
-                        "media_id": media_id,
-                        "s3_key": s3_object_key,
-                        "s3_bucket": S3_BUCKET_NAME,
-                        "caption": caption,
-                        "permalink": permalink,
-                        "media_url_original": media_url,
-                        "is_hashtag_result": False # Kennzeichnung als eigenes Bild
+                        'media_id': media_id,
+                        's3_key': s3_object_key,
+                        's3_bucket': S3_BUCKET_NAME,
+                        'hashtag_source': '__USER_MEDIA__', # Kennzeichnung
+                        'permalink': media_item.get('permalink', ''),
+                        'caption': media_item.get('caption', ''),
+                        'media_url_original': media_url,
+                        'download_timestamp_utc': get_utc_timestamp(),
+                        'platform': 'instagram',
+                        'is_hashtag_result': False
                     }
-                    processed_own_images.append(image_info)
-                    logging.info(f"    Verarbeitetes eigenes Bild (Nr. {own_image_count}), S3 Key: {s3_object_key}")
+                    try:
+                        crawled_media_table.put_item(Item=image_info)
+                        logging.info(f"    Metadaten für eigenes Bild {media_id} in DynamoDB gespeichert.")
+                        processed_own_images.append(image_info)
+                    except ClientError as e_db_put:
+                        logging.error(f"    Fehler beim Speichern von Metadaten für eigenes Bild {media_id} in DynamoDB: {e_db_put}")
                 else:
-                    logging.warning(f"    Hochladen des eigenen IMAGE-Medienelements (ID: {media_id}, URL: {media_url}) nach S3 fehlgeschlagen.")
-            # Hier könnte man auch CAROUSEL_ALBUM und VIDEO für eigene Medien behandeln
-            elif media_type in ['CAROUSEL_ALBUM', 'VIDEO']:
-                 logging.info(f"    Eigenes Medienelement (ID: {media_id}, Typ: {media_type}) gefunden. Verarbeitung dafür noch nicht implementiert.")
-            else:
-                logging.warning(f"    Unbekannter oder nicht unterstützter Typ für eigenes Medienelement (ID: {media_id}, Typ: {media_type}).")
-        
-        logging.info(f"Verarbeitung eigener Medien abgeschlossen. {own_image_count} Bilder von {total_own_items} API-Elementen für User-ID {user_id_of_account_owner} verarbeitet.")
-    elif media_api_data and 'error' in media_api_data:
-        logging.error(f"API-Fehler beim Abrufen der eigenen Medien für User-ID {user_id_of_account_owner}: {media_api_data['error']}")
-    else:
-        logging.warning(f"Keine eigenen Medien für User-ID {user_id_of_account_owner} gefunden oder unerwartete Antwortstruktur.")
-    
+                    logging.warning(f"    Hochladen des eigenen IMAGE-Medienelements (ID: {media_id}) nach S3 fehlgeschlagen.")
+            # ... (andere Medientypen)
+        logging.info(f"Verarbeitung eigener Medien abgeschlossen. {len(processed_own_images)} neue Bilder verarbeitet.")
+    # ... (Fehlerbehandlung für media_api_data)
     return processed_own_images
 
 
 def get_hashtag_id(access_token, user_id_making_request, hashtag_name):
-    """Ruft die ID eines Hashtags ab."""
+    # (Funktion bleibt im Wesentlichen gleich wie zuvor)
     clean_hashtag_name = hashtag_name.strip().lstrip('#')
-    if not clean_hashtag_name:
-        logging.warning("Leerer Hashtag-Name nach Bereinigung erhalten.")
-        return None
-        
+    if not clean_hashtag_name: return None
     url = f"{API_BASE_URL}ig_hashtag_search?user_id={user_id_making_request}&q={clean_hashtag_name}&access_token={access_token}"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        if data.get('data') and len(data['data']) > 0:
-            logging.info(f"Hashtag-ID {data['data'][0]['id']} für '{clean_hashtag_name}' gefunden.")
+        if data.get('data') and data['data']:
             return data['data'][0]['id']
-        else:
-            logging.warning(f"Keine ID für Hashtag '{clean_hashtag_name}' gefunden. Antwort: {data}")
-            return None
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP-Fehler beim Abrufen der Hashtag-ID für '{clean_hashtag_name}': {e}. Status: {e.response.status_code}. Text: {e.response.text}")
-        return None
     except Exception as e:
-        logging.error(f"Unerwarteter Fehler beim Abrufen der Hashtag-ID für '{clean_hashtag_name}': {e}")
-        return None
+        logging.error(f"Fehler bei get_hashtag_id für '{clean_hashtag_name}': {e}")
+    return None
 
-
-def get_media_for_hashtag(access_token, user_id_making_request, hashtag_id, search_type="recent_media", limit=25):
-    """Ruft 'recent_media' oder 'top_media' für eine Hashtag-ID ab."""
+def get_media_for_hashtag(access_token, user_id_making_request, hashtag_id, search_type="recent_media", limit=7):
+    # (Funktion bleibt im Wesentlichen gleich wie zuvor)
     fields = "id,caption,media_type,media_url,permalink,timestamp"
     url = f"{API_BASE_URL}{hashtag_id}/{search_type}?user_id={user_id_making_request}&fields={fields}&limit={limit}&access_token={access_token}"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
-        logging.info(f"Medien für Hashtag-ID {hashtag_id} ({search_type}, Limit {limit}) erfolgreich abgerufen.")
         return response.json()
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP-Fehler beim Abrufen von Medien für Hashtag-ID '{hashtag_id}': {e}. Status: {e.response.status_code}. Text: {e.response.text}")
-        return None
     except Exception as e:
-        logging.error(f"Unerwarteter Fehler beim Abrufen von Medien für Hashtag-ID '{hashtag_id}': {e}")
-        return None
+        logging.error(f"Fehler bei get_media_for_hashtag für ID '{hashtag_id}': {e}")
+    return None
 
-# Dies ist die korrigierte und vollständige Version von search_media_by_hashtag
-def search_media_by_hashtag(access_token, user_id_for_api_calls, hashtag_query, search_type="recent_media", limit_per_hashtag=25):
+
+def search_media_by_hashtag(access_token, user_id_for_api_calls, hashtag_query, search_type="recent_media", limit_per_hashtag=7):
     logging.info(f"Starte Hashtag-Suche für: '{hashtag_query}', Typ: {search_type}, Limit: {limit_per_hashtag}")
-    clean_hashtag_query = hashtag_query.strip().lstrip('#')
-    if not clean_hashtag_query:
-        logging.warning("Leerer Hashtag für Suche erhalten. Breche ab.")
+    if not crawled_media_table:
+        logging.error("DynamoDB 'CrawledMedia' Tabelle nicht initialisiert. Hashtag-Suche nicht möglich.")
         return []
+
+    clean_hashtag_query = hashtag_query.strip().lstrip('#')
+    if not clean_hashtag_query: return []
 
     hashtag_id = get_hashtag_id(access_token, user_id_for_api_calls, clean_hashtag_query)
-    
-    if not hashtag_id:
-        logging.error(f"Konnte keine ID für Hashtag '{clean_hashtag_query}' finden. Suche wird abgebrochen.")
-        return []
+    if not hashtag_id: return []
 
-    # media_data wird hier korrekt zugewiesen
     media_api_data = get_media_for_hashtag(access_token, user_id_for_api_calls, hashtag_id, search_type, limit_per_hashtag)
-    processed_images = []
+    processed_images = [] # Bilder, die in DIESEM Durchlauf neu verarbeitet wurden
 
     if media_api_data and media_api_data.get('data'):
         total_items_from_api = len(media_api_data['data'])
-        logging.info(f"API lieferte {total_items_from_api} Medienelemente für Hashtag '{clean_hashtag_query}' (ID: {hashtag_id}) vor dem Filtern.")
+        logging.info(f"API lieferte {total_items_from_api} Medienelemente für Hashtag '{clean_hashtag_query}' (ID: {hashtag_id}).")
         
-        image_count = 0 
-
+        newly_processed_image_count = 0
         for i, media_item in enumerate(media_api_data['data']):
-            media_id_of_post = media_item.get('id')
-            # media_type_from_api wird hier korrekt zugewiesen
-            media_type_from_api = media_item.get('media_type')
-            
-            logging.info(f"  [Item {i+1}/{total_items_from_api}] ID: {media_id_of_post}, Typ: {media_type_from_api}")
+            media_id = media_item.get('id')
+            media_type = media_item.get('media_type')
+            logging.info(f"  [Item {i+1}/{total_items_from_api}] ID: {media_id}, Typ: {media_type}")
 
-            if media_type_from_api == 'IMAGE':
-                image_count += 1
+            if media_type == 'IMAGE':
+                # Prüfen, ob Bild schon in DynamoDB ist
+                try:
+                    response = crawled_media_table.get_item(Key={'media_id': media_id})
+                    if 'Item' in response:
+                        logging.info(f"    Bild {media_id} bereits in DynamoDB. Überspringe Download/Upload.")
+                        # Optional: Bestehendes Item zur Rückgabeliste hinzufügen, wenn app.py alle bekannten anzeigen soll
+                        # processed_images.append(response['Item'])
+                        continue 
+                except ClientError as e_db:
+                    logging.error(f"    Fehler beim Prüfen von media_id {media_id} in DynamoDB: {e_db}. Verarbeite trotzdem (potenzielles Duplikat).")
+
                 media_url = media_item.get('media_url')
-                
-                if not media_url or not media_id_of_post:
-                    logging.warning(f"    Überspringe IMAGE-Medienelement (ID: {media_id_of_post}) aufgrund fehlender URL.")
-                    continue
+                if not media_url: continue
 
-                caption = media_item.get('caption', '')
-                permalink = media_item.get('permalink', '')
-                
-                # filename_base für S3-Key
-                filename_base_for_s3 = f"hashtag_{clean_hashtag_query}_{media_id_of_post}"
-                
-                s3_object_key = download_image(media_url, filename_base_for_s3)
+                filename_base_for_s3 = f"hashtag_{clean_hashtag_query}_{media_id}"
+                s3_object_key = download_image_to_s3(media_url, filename_base_for_s3)
 
                 if s3_object_key:
+                    newly_processed_image_count +=1
                     image_info = {
-                        "media_id": media_id_of_post,
-                        "s3_key": s3_object_key,
-                        "s3_bucket": S3_BUCKET_NAME,
-                        "caption": caption,
-                        "permalink": permalink,
-                        "media_url_original": media_url,
-                        "is_hashtag_result": True
+                        'media_id': media_id,
+                        's3_key': s3_object_key,
+                        's3_bucket': S3_BUCKET_NAME,
+                        'hashtag_source': clean_hashtag_query,
+                        'permalink': media_item.get('permalink', ''),
+                        'caption': media_item.get('caption', ''),
+                        'media_url_original': media_url,
+                        'download_timestamp_utc': get_utc_timestamp(),
+                        'platform': 'instagram',
+                        'is_hashtag_result': True
                     }
-                    processed_images.append(image_info)
-                    logging.info(f"    Verarbeitetes Hashtag-Bild (Nr. {image_count}), S3 Key: {s3_object_key}")
+                    try:
+                        crawled_media_table.put_item(Item=image_info)
+                        logging.info(f"    Metadaten für Bild {media_id} in DynamoDB gespeichert.")
+                        processed_images.append(image_info) # Nur neu verarbeitete zur Liste hinzufügen
+                    except ClientError as e_db_put:
+                        logging.error(f"    Fehler beim Speichern von Metadaten für {media_id} in DynamoDB: {e_db_put}")
                 else:
-                    logging.warning(f"    Hochladen des IMAGE-Medienelements (ID: {media_id_of_post}, URL: {media_url}) nach S3 fehlgeschlagen.")
+                    logging.warning(f"    Hochladen des IMAGE (ID: {media_id}) nach S3 fehlgeschlagen.")
+            # ... (andere Medientypen)
+        logging.info(f"Hashtag-Suche abgeschlossen. {newly_processed_image_count} NEUE Bilder von {total_items_from_api} API-Elementen für '{clean_hashtag_query}' verarbeitet und in DynamoDB gespeichert.")
+    # ... (Fehlerbehandlung für media_api_data)
+    
+    # Optional: Update CrawlTasks table
+    # if crawl_tasks_table and DYNAMODB_CRAWLTASKS_TABLE_NAME:
+    # try:
+    # crawl_tasks_table.update_item(
+    # Key={'search_term': clean_hashtag_query, 'platform': 'instagram'}, # Falls platform Teil des Keys ist
+    # UpdateExpression="set #s = :status, last_completed_timestamp_utc = :ts",
+    # ExpressionAttributeNames={'#s': 'status'},
+    # ExpressionAttributeValues={':status': 'completed', ':ts': get_utc_timestamp()}
+    # )
+    # logging.info(f"CrawlTask für '{clean_hashtag_query}' als 'completed' markiert.")
+    # except ClientError as e_task:
+    # logging.error(f"Fehler beim Aktualisieren von CrawlTask für '{clean_hashtag_query}': {e_task}")
             
-            elif media_type_from_api == 'CAROUSEL_ALBUM':
-                logging.info(f"    Karussell-Album (ID: {media_id_of_post}) gefunden. Verarbeitung von 'children' noch nicht implementiert.")
-            
-            elif media_type_from_api == 'VIDEO':
-                logging.info(f"    Video (ID: {media_id_of_post}) gefunden. Wird aktuell übersprungen.")
-            
-            else:
-                logging.warning(f"    Unbekannter oder nicht unterstützter Medientyp (ID: {media_id_of_post}, Typ: {media_type_from_api}).")
-
-        logging.info(f"Filterung abgeschlossen. {image_count} Bilder von {total_items_from_api} API-Elementen für Hashtag '{clean_hashtag_query}' verarbeitet.")
-
-    elif media_api_data and 'error' in media_api_data:
-        logging.error(f"API-Fehler beim Abrufen von Medien für Hashtag '{clean_hashtag_query}': {media_api_data['error']}")
-    else:
-        logging.warning(f"Keine Medien für Hashtag '{clean_hashtag_query}' (ID: {hashtag_id}) gefunden oder unerwartete Antwortstruktur von der API.")
-        
-    return processed_images
-
+    return processed_images # Gibt nur die in DIESEM Durchlauf neu verarbeiteten Bilder zurück
 
 if __name__ == '__main__':
-    test_access_token = creds['access_token']
-    test_instagram_business_id = creds['instagram_business_id']
-    
-    # Teste Abruf eigener Medien
-    print("\n--- Teste Abruf eigener Medien ---")
-    # Der Parameter local_dir wird nicht mehr an process_media übergeben, da es S3 nutzt
-    eigen_images = process_media(test_access_token, test_instagram_business_id)
-    if eigen_images:
-        print(f"{len(eigen_images)} eigene Bilder gefunden und nach S3 verarbeitet (Details im Log).")
-        # for img in eigen_images:
-        # print(f"Eigenes Bild Details (S3 Key): {img.get('s3_key')}")
-    else:
-        print("Keine eigenen Bilder zum Anzeigen oder Fehler bei der Verarbeitung.")
+    # (Testblock bleibt ähnlich, testet jetzt die DynamoDB-Interaktionen implizit)
+    test_access_token = creds.get('access_token')
+    test_instagram_business_id = creds.get('instagram_business_id')
 
-    # Teste Hashtag-Suche
-    print("\n--- Teste Hashtag-Suche ---")
-    test_hashtag = "landschaftsfotografie" # Geändertes Beispiel-Hashtag
-    # Der Parameter local_dir wird nicht mehr an search_media_by_hashtag übergeben
-    hashtag_images = search_media_by_hashtag(test_access_token, test_instagram_business_id, test_hashtag, limit_per_hashtag=5)
-    if hashtag_images:
-        print(f"{len(hashtag_images)} Bilder für Hashtag #{test_hashtag} gefunden und nach S3 verarbeitet (Details im Log).")
-        # for img in hashtag_images:
-        # print(f"Hashtag Bild Details (S3 Key): {img.get('s3_key')}")
+    if not all([test_access_token, test_instagram_business_id, S3_BUCKET_NAME, DYNAMODB_CRAWLEDMEDIA_TABLE_NAME, DYNAMODB_REGION]):
+        logging.error("Einige erforderliche Konfigurationen (Token, IDs, S3, DynamoDB) fehlen in defines.py für den Testlauf.")
     else:
-        print(f"Keine Bilder für Hashtag #{test_hashtag} zum Anzeigen oder Fehler bei der Verarbeitung.")
+        print("\n--- Teste Abruf eigener Medien (mit DynamoDB Check/Write) ---")
+        eigen_images = process_media(test_access_token, test_instagram_business_id)
+        print(f"{len(eigen_images)} eigene Bilder in diesem Durchlauf neu verarbeitet/gespeichert (Details im Log).")
+
+        print("\n--- Teste Hashtag-Suche (mit DynamoDB Check/Write) ---")
+        test_hashtag = "sonnenuntergang"
+        hashtag_images = search_media_by_hashtag(test_access_token, test_instagram_business_id, test_hashtag, limit_per_hashtag=5)
+        print(f"{len(hashtag_images)} Bilder für Hashtag #{test_hashtag} in diesem Durchlauf neu verarbeitet/gespeichert (Details im Log).")

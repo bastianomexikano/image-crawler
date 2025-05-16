@@ -52,7 +52,7 @@
             box-shadow: 0 0 0 2px rgba(24, 119, 242, 0.2);
             outline: none;
         }
-        button[type="submit"] {
+        button[type="submit"], .update-button {
             padding: 12px 20px;
             background-color: #1877f2;
             color: white;
@@ -63,13 +63,21 @@
             cursor: pointer;
             transition: background-color 0.2s;
         }
-        button[type="submit"]:hover {
+        button[type="submit"]:hover, .update-button:hover {
             background-color: #166fe5;
+        }
+        .update-button {
+            background-color: #42b72a; /* Grün für Aktualisieren */
+            margin-left: 10px; /* Etwas Abstand zum Suchfeld */
+        }
+        .update-button:hover {
+            background-color: #36a420;
         }
         .image-gallery {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); /* Responsive Grid */
             gap: 20px;
+            min-height: 100px; /* Mindesthöhe, um "Laden..." anzuzeigen */
         }
         .image-item {
             border: 1px solid #dddfe2;
@@ -79,93 +87,238 @@
             box-shadow: 0 1px 2px rgba(0,0,0,0.1);
             display: flex;
             flex-direction: column;
-            overflow: hidden; /* Verhindert, dass Inhalte überlaufen */
+            overflow: hidden; 
         }
         .image-item img {
             width: 100%;
             height: auto;
-            aspect-ratio: 1 / 1; /* Sorgt für quadratische Bilder, passt sich der Breite an */
-            object-fit: cover; /* Skaliert das Bild, um den Container zu füllen, schneidet ggf. ab */
+            aspect-ratio: 1 / 1; 
+            object-fit: cover; 
             border-radius: 6px;
             margin-bottom: 12px;
-            background-color: #e0e0e0; /* Platzhalterfarbe, falls Bild langsam lädt */
+            background-color: #e0e0e0; 
         }
         .image-item .caption {
             font-size: 0.9em;
             color: #333;
             margin-bottom: 8px;
-            word-wrap: break-word; /* Lange Wörter umbrechen */
-            max-height: 60px; /* Ca. 3 Zeilen Text */
-            overflow-y: auto; /* Scrollbar, falls Caption zu lang */
+            word-wrap: break-word; 
+            max-height: 60px; 
+            overflow-y: auto; 
         }
         .image-item .permalink {
             font-size: 0.85em;
             color: #1877f2;
             text-decoration: none;
-            margin-top: auto; /* Schiebt den Link nach unten, wenn Platz ist */
-            display: inline-block; /* Für bessere Klickbarkeit */
+            margin-top: auto; 
+            display: inline-block; 
         }
         .image-item .permalink:hover {
             text-decoration: underline;
         }
         .image-item .error-message {
-            color: #fa383e; /* Rote Fehlerfarbe */
+            color: #fa383e; 
             font-weight: bold;
             text-align: center;
             padding: 10px;
         }
-        .no-images {
-            text-align: center;
-            color: #606770;
-            font-size: 1.1em;
-            padding: 20px;
-        }
-        .search-info {
+        .status-message, .search-info { /* Zusammengefasst für Konsistenz */
             text-align: center;
             margin-bottom: 20px;
+            padding: 10px;
+            border-radius: 6px;
+        }
+        .search-info {
             font-style: italic;
             color: #606770;
+        }
+        .status-message.info {
+            background-color: #e7f3ff;
+            color: #1877f2;
+        }
+        .status-message.error {
+            background-color: #ffebe8;
+            color: #fa383e;
+        }
+        .status-message.success {
+            background-color: #e9f7ef;
+            color: #42b72a;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Instagram Image Crawler (S3)</h1>
-        <form method="post">
-            <input type="text" name="hashtag" placeholder="Hashtag eingeben (z.B. natur)" value="{{ current_hashtag if current_hashtag else '' }}">
+        <h1>Instagram Image Crawler (S3 & Lambda)</h1>
+        <form method="post" id="searchForm">
+            <input type="text" name="hashtag" id="hashtagInput" placeholder="Hashtag eingeben (z.B. natur)" value="{{ current_hashtag if current_hashtag else '' }}">
             <button type="submit">Suchen</button>
+            <button type="button" class="update-button" id="updateGalleryButton" style="display: none;">Galerie aktualisieren</button>
         </form>
 
-        {% if search_term_display %}
-            <p class="search-info">{{ search_term_display }}</p>
+        {% if message_to_user %}
+            <p class="status-message info">{{ message_to_user }}</p>
         {% endif %}
 
-        {% if images %}
-            <div class="image-gallery">
-                {% for img in images %}
-                    <div class="image-item">
-                        {% if img.display_url and not img.error_generating_url %}
-                            <a href="{{ img.permalink if img.permalink else '#' }}" target="_blank" title="Original Post auf Instagram ansehen">
-                                <img src="{{ img.display_url | safe }}" alt="Instagram Bild ID: {{ img.media_id if img.media_id else 'Unbekannt' }}">
-                            </a>
-                        {% else %}
-                            <div class="error-message">Fehler beim Laden des Bildes.</div>
-                        {% endif %}
-                        
-                        {% if img.caption %}
-                            <p class="caption" title="{{ img.caption }}">{{ img.caption[:120] }}{% if img.caption|length > 120 %}...{% endif %}</p>
-                        {% else %}
-                            <p class="caption"><em>Keine Bildbeschreibung vorhanden.</em></p>
-                        {% endif %}
-                        
-                        {% if img.permalink %}
-                            <a href="{{ img.permalink }}" target="_blank" class="permalink">Original Post ansehen</a>
-                        {% endif %}
-                        </div>
-                {% endfor %}
-            </div>
-        {% elif request.method == "POST" %} <p class="no-images">Keine Bilder für diesen Hashtag gefunden oder es gab ein Problem bei der Suche.</p>
+        {% if search_term_display %}
+            <p class="search-info" id="searchTermDisplay">{{ search_term_display }}</p>
+        {% else %}
+            <p class="search-info" id="searchTermDisplay" style="display:none;"></p>
         {% endif %}
+        
+        <div id="galleryStatusMessage" class="status-message" style="display:none;"></div>
+        
+        <div class="image-gallery" id="imageGallery">
+            {# Die initialen Bilder von der direkten Suche werden nicht mehr direkt hier gerendert, 
+               JS übernimmt das Laden aller Bilder über /api/gallery #}
+        </div>
     </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const hashtagInput = document.getElementById('hashtagInput');
+            const imageGallery = document.getElementById('imageGallery');
+            const galleryStatusMessage = document.getElementById('galleryStatusMessage');
+            const updateGalleryButton = document.getElementById('updateGalleryButton');
+            const searchTermDisplayElement = document.getElementById('searchTermDisplay');
+
+            // Hilfsfunktion, um das '#' am Anfang eines Hashtags zu entfernen
+            function cleanHashtag(tag) {
+                if (typeof tag === 'string' && tag.startsWith('#')) {
+                    return tag.substring(1);
+                }
+                return tag;
+            }
+
+            // Holt den aktuellen Hashtag aus dem Input-Feld (wird vom Server nach POST gesetzt)
+            const initialHashtag = hashtagInput.value.trim();
+
+            if (initialHashtag) {
+                fetchGallery(initialHashtag);
+                updateGalleryButton.style.display = 'inline-block'; // Zeige Button, wenn ein Hashtag da ist
+                if (searchTermDisplayElement && !searchTermDisplayElement.textContent.includes(initialHashtag)) {
+                    // Stelle sicher, dass der Suchbegriff korrekt angezeigt wird
+                    searchTermDisplayElement.textContent = `Ergebnisse für Hashtag: #${cleanHashtag(initialHashtag)}`;
+                    searchTermDisplayElement.style.display = 'block';
+                }
+            }
+
+            document.getElementById('searchForm').addEventListener('submit', function(event) {
+                // Das Formular wird normal per POST abgeschickt.
+                // Nach dem Neuladen der Seite wird der 'DOMContentLoaded' Event erneut ausgelöst,
+                // und fetchGallery wird mit dem neuen Hashtag (aus dem Input-Feld) aufgerufen.
+                // Der Update-Button wird dann auch sichtbar.
+                const currentSearchTerm = hashtagInput.value.trim();
+                if (currentSearchTerm) {
+                    searchTermDisplayElement.textContent = `Suche nach Hashtag: #${cleanHashtag(currentSearchTerm)}...`;
+                    searchTermDisplayElement.style.display = 'block';
+                }
+            });
+            
+            updateGalleryButton.addEventListener('click', function() {
+                const currentHashtag = hashtagInput.value.trim();
+                if (currentHashtag) {
+                    fetchGallery(currentHashtag);
+                } else {
+                    setGalleryStatus("Bitte zuerst einen Hashtag suchen.", "info");
+                }
+            });
+
+            function fetchGallery(hashtag) {
+                if (!hashtag) return;
+
+                const cleanedHashtag = cleanHashtag(hashtag); // Hashtag ohne # für die API
+
+                setGalleryStatus("Lade Bildergalerie...", "info", true);
+                updateGalleryButton.disabled = true;
+                updateGalleryButton.textContent = 'Aktualisiere...';
+
+                fetch(`/api/gallery/${encodeURIComponent(cleanedHashtag)}`)
+                    .then(response => {
+                        if (!response.ok) {
+                            // Versuche, Fehlerdetails aus dem JSON-Body zu lesen, falls vorhanden
+                            return response.json().then(errData => {
+                                throw new Error(`HTTP Fehler! Status: ${response.status}. Meldung: ${errData.error || response.statusText}`);
+                            }).catch(() => {
+                                // Falls der Body kein JSON ist oder leer
+                                throw new Error(`HTTP Fehler! Status: ${response.status} ${response.statusText}`);
+                            });
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        updateGalleryButton.disabled = false;
+                        updateGalleryButton.textContent = 'Galerie aktualisieren';
+                        renderGallery(data.images || []);
+                        if (data.images && data.images.length > 0) {
+                           setGalleryStatus(`Galerie für #${cleanedHashtag} geladen (${data.images.length} Bilder).`, "success");
+                        } else {
+                           setGalleryStatus(`Keine Bilder für Hashtag #${cleanedHashtag} in der Datenbank gefunden. Die Hintergrundverarbeitung könnte noch laufen.`, "info");
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Fehler beim Laden der Galerie:', error);
+                        setGalleryStatus(`Fehler beim Laden der Galerie für #${cleanedHashtag}: ${error.message}`, "error");
+                        imageGallery.innerHTML = `<p class="status-message error">Fehler beim Laden der Bilder: ${error.message}</p>`;
+                        updateGalleryButton.disabled = false;
+                        updateGalleryButton.textContent = 'Galerie aktualisieren';
+                    });
+            }
+
+            function renderGallery(images) {
+                imageGallery.innerHTML = ''; // Alte Galerie leeren
+
+                if (!images || images.length === 0) {
+                    // Status wird bereits von fetchGallery gesetzt oder bleibt von dort
+                    return;
+                }
+
+                images.forEach(img => {
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'image-item';
+
+                    let imageHtml = '';
+                    if (img.display_url && img.display_url !== '#' && !img.error_generating_url) {
+                        imageHtml = `
+                            <a href="${img.permalink || '#'}" target="_blank" title="Original Post auf Instagram ansehen">
+                                <img src="${img.display_url}" alt="Instagram Bild ID: ${img.media_id || 'Unbekannt'}">
+                            </a>`;
+                    } else {
+                        imageHtml = '<div class="error-message">Fehler beim Laden des Bildes.</div>';
+                    }
+
+                    const captionHtml = img.caption ?
+                        `<p class="caption" title="${escapeHtml(img.caption)}">${escapeHtml(img.caption.substring(0,120))}${img.caption.length > 120 ? '...' : ''}</p>` :
+                        '<p class="caption"><em>Keine Bildbeschreibung vorhanden.</em></p>';
+
+                    const permalinkHtml = img.permalink ?
+                        `<a href="${img.permalink}" target="_blank" class="permalink">Original Post ansehen</a>` : '';
+                    
+                    itemDiv.innerHTML = imageHtml + captionHtml + permalinkHtml;
+                    imageGallery.appendChild(itemDiv);
+                });
+            }
+
+            function setGalleryStatus(message, type = 'info', isLoading = false) {
+                galleryStatusMessage.textContent = message;
+                galleryStatusMessage.className = `status-message ${type}`; 
+                galleryStatusMessage.style.display = 'block';
+
+                if (isLoading) {
+                    imageGallery.innerHTML = ''; 
+                }
+            }
+            
+            function escapeHtml(unsafe) {
+                if (unsafe === null || typeof unsafe === 'undefined') return '';
+                return unsafe
+                     .toString()
+                     .replace(/&/g, "&amp;")
+                     .replace(/</g, "&lt;")
+                     .replace(/>/g, "&gt;")
+                     .replace(/"/g, "&quot;")
+                     .replace(/'/g, "&#039;");
+            }
+        });
+    </script>
 </body>
 </html>
